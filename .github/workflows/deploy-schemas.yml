@@ -1,0 +1,54 @@
+name: Deploy Schemas to Confluent Schema Registry
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy-schemas:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy schemas
+        env:
+          SCHEMA_REGISTRY_URL: ${{ secrets.SCHEMA_REGISTRY_URL }}
+          API_KEY: ${{ secrets.SCHEMA_REGISTRY_API_KEY }}
+          API_SECRET: ${{ secrets.SCHEMA_REGISTRY_API_SECRET }}
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+
+          SCHEMA_DIR="schemas"  # Update this to your schema directory path
+          echo "Using Schema Registry: $SCHEMA_REGISTRY_URL"
+
+          # Process all .avsc files in the schema directory
+          find "$SCHEMA_DIR" -name '*.avsc' | while read -r schema_file; do
+            subject_name=$(basename "$schema_file" .avsc)
+            echo "Deploying schema: $subject_name"
+
+            # Prepare payload with escaped schema content
+            schema_content=$(jq -c . "$schema_file" | jq -R)
+            payload=$(jq -n --arg schema "$schema_content" '{schema: $schema}')
+
+            # Send request to Schema Registry
+            response=$(curl -sS -w "\n%{http_code}" \
+              -u "${API_KEY}:${API_SECRET}" \
+              -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+              -X POST \
+              --data "$payload" \
+              "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions")
+
+            # Separate HTTP status code from response body
+            http_code=$(echo "$response" | tail -n1)
+            response_body=$(echo "$response" | sed '$d')
+
+            if [[ $http_code -ge 200 && $http_code -lt 300 ]]; then
+              echo "✅ Successfully deployed schema. Response: $response_body"
+            else
+              echo "❌ Deployment failed for $subject_name. HTTP $http_code: $response_body"
+              exit 1
+            fi
+          done
