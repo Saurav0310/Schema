@@ -12,6 +12,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Validate schemas
+        run: |
+          SCHEMA_DIR="schemas"
+          find "$SCHEMA_DIR" -name '*.avsc' | while read schema_file; do
+            if ! jq empty "$schema_file" &>/dev/null; then
+              echo "❌ Invalid JSON in $schema_file"
+              exit 1
+            fi
+          done
+
       - name: Deploy schemas
         env:
           SCHEMA_REGISTRY_URL: ${{ secrets.SCHEMA_REGISTRY_URL }}
@@ -19,36 +29,62 @@ jobs:
           API_SECRET: ${{ secrets.SCHEMA_REGISTRY_API_SECRET }}
         run: |
           #!/bin/bash
-          set -euo pipefail
+          set -eo pipefail
+          SCHEMA_DIR="schemas"
+          FAILED=0
 
-          SCHEMA_DIR="schemas"  # Update this to your schema directory path
-          echo "Using Schema Registry: $SCHEMA_REGISTRY_URL"
+          echo "Validating API key permissions..."
+          if ! curl -sS -u "${API_KEY}:${API_SECRET}" \
+            "${SCHEMA_REGISTRY_URL}/mode" >/dev/null; then
+            echo "❌ FATAL: API key authentication failed or lacks basic permissions"
+            exit 1
+          fi
 
-          # Process all .avsc files in the schema directory
           find "$SCHEMA_DIR" -name '*.avsc' | while read -r schema_file; do
             subject_name=$(basename "$schema_file" .avsc)
-            echo "Deploying schema: $subject_name"
+            echo "🚀 Deploying schema: $subject_name"
 
-            # Prepare payload with escaped schema content
-            schema_content=$(jq -c . "$schema_file" | jq -R)
-            payload=$(jq -n --arg schema "$schema_content" '{schema: $schema}')
+            # Create properly formatted payload
+            payload=$(jq -n --arg schema "$(cat "$schema_file" | jq -c .)" \
+              '{schema: $schema, schemaType: "AVRO"}')
 
-            # Send request to Schema Registry
+            # Capture full response
             response=$(curl -sS -w "\n%{http_code}" \
               -u "${API_KEY}:${API_SECRET}" \
               -H "Content-Type: application/vnd.schemaregistry.v1+json" \
               -X POST \
               --data "$payload" \
-              "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions")
+              "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions" 2>&1) || true
 
-            # Separate HTTP status code from response body
             http_code=$(echo "$response" | tail -n1)
-            response_body=$(echo "$response" | sed '$d')
+            response_body=$(echo "$response" | head -n -1)
 
-            if [[ $http_code -ge 200 && $http_code -lt 300 ]]; then
-              echo "✅ Successfully deployed schema. Response: $response_body"
-            else
-              echo "❌ Deployment failed for $subject_name. HTTP $http_code: $response_body"
-              exit 1
-            fi
+            case $http_code in
+              200|201|202)
+                echo "✅ Success! New schema version: $(echo "$response_body" | jq .id)"
+                ;;
+              401|403)
+                echo "❌ PERMISSION DENIED: $response_body"
+                echo "   Required permission: 'Write' on subject: $subject_name"
+                echo "   Manage permissions at: https://confluent.cloud/schema-registry/subjects/$subject_name/permissions"
+                FAILED=1
+                ;;
+              409)
+                echo "⚠️  Schema already exists: $subject_name (compatible)"
+                ;;
+              422)
+                echo "❌ Schema compatibility failed: $subject_name"
+                echo "$response_body"
+                FAILED=1
+                ;;
+              *)
+                echo "❌ Unexpected error ($http_code): $response_body"
+                FAILED=1
+                ;;
+            esac
           done
+
+          if [ $FAILED -ne 0 ]; then
+            echo "Some schemas failed to deploy. Check logs for details."
+            exit 1
+          fi
