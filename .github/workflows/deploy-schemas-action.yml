@@ -1,0 +1,21 @@
+name: Schema Registry Deployment
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy-schemas:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy Schemas
+        uses: ./.github/actions/schema-registry-deploy
+        with:
+          schema-dir: 'schemas'  # Path to your schemas
+          registry-url: ${{ secrets.SCHEMA_REGISTRY_URL }}
+          api-key: ${{ secrets.SCHEMA_REGISTRY_API_KEY }}
+          api-secret: ${{ secrets.SCHEMA_REGISTRY_API_SECRET }}
