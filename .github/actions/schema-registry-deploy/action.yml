@@ -1,120 +1,232 @@
 name: 'Deploy to Schema Registry'
-description: 'Deploy Avro schemas to Confluent Schema Registry'
+description: 'Deploy Avro schemas to Confluent Schema Registry (non-prod + prod)'
+
 inputs:
-  schema-dir:
-    description: 'Path to schema directory'
-    required: true
-    default: 'schemas'
+  # Non-prod
   registry-url:
-    description: 'Confluent Schema Registry URL'
-    required: true
+    description: 'Confluent Schema Registry URL (non-prod)'
+    required: false
   api-key:
-    description: 'Confluent API Key'
-    required: true
+    description: 'Confluent API Key (non-prod)'
+    required: false
   api-secret:
-    description: 'Confluent API Secret'
-    required: true
+    description: 'Confluent API Secret (non-prod)'
+    required: false
+
+  # Prod
+  prod-registry-url:
+    description: 'Confluent Schema Registry URL (prod)'
+    required: false
+  prod-api-key:
+    description: 'Confluent API Key (prod)'
+    required: false
+  prod-api-secret:
+    description: 'Confluent API Secret (prod)'
+    required: false
 
 runs:
   using: "composite"
   steps:
-    - name: Validate schemas
+    - name: Deploy non-prod schemas
       shell: bash
-      run: |
-        SCHEMA_DIR="${{ inputs.schema-dir }}"
-        echo "🔍 Validating schemas in $SCHEMA_DIR"
-        for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
-          if ! jq empty "$schema_file" &>/dev/null; then
-            echo "❌ Invalid JSON in $schema_file"
-            exit 1
-          fi
-        done
-        echo "✅ All schemas validated"
-
-    - name: Deploy schemas
-      shell: bash
-      env:
-        SCHEMA_REGISTRY_URL: ${{ inputs.registry-url }}
-        API_KEY: ${{ inputs.api-key }}
-        API_SECRET: ${{ inputs.api-secret }}
       run: |
         set -eo pipefail
-        SCHEMA_DIR="${{ inputs.schema-dir }}"
+        SCHEMA_DIR="schemas"
 
-        echo "🔐 Validating API key permissions..."
-        if ! curl -sS -u "${API_KEY}:${API_SECRET}" \
-          "${SCHEMA_REGISTRY_URL}/mode" >/dev/null; then
-          echo "❌ FATAL: API key authentication failed or lacks basic permissions"
-          exit 1
+        if [ -d "$SCHEMA_DIR" ]; then
+          echo "📂 Found non-prod schemas in $SCHEMA_DIR"
+          if [ -z "${{ inputs.registry-url }}" ] || [ -z "${{ inputs.api-key }}" ] || [ -z "${{ inputs.api-secret }}" ]; then
+            echo "❌ Non-prod schemas detected but non-prod secrets are missing!"
+            exit 1
+          fi
+
+          echo "🔐 Validating API key permissions..."
+          if ! curl -sS -u "${{ inputs.api-key }}:${{ inputs.api-secret }}" \
+            "${{ inputs.registry-url }}/mode" >/dev/null; then
+            echo "❌ FATAL: API key authentication failed or lacks basic permissions"
+            exit 1
+          fi
+
+          echo "🔍 Validating schemas in $SCHEMA_DIR"
+          for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
+            if ! jq empty "$schema_file" &>/dev/null; then
+              echo "❌ Invalid JSON in $schema_file"
+              exit 1
+            fi
+          done
+          echo "✅ All schemas validated"
+
+          for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
+            subject_name=$(basename "$schema_file" .avsc)
+            echo "🚀 Deploying schema: $subject_name"
+
+            schema_content=$(jq -c . < "$schema_file")
+            payload=$(jq -n --arg schema "$schema_content" \
+              '{schema: $schema, schemaType: "AVRO"}')
+
+            response=$(curl -sS -w "\n%{http_code}" \
+              -u "${{ inputs.api-key }}:${{ inputs.api-secret }}" \
+              -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+              -X POST \
+              --data "$payload" \
+              "${{ inputs.registry-url }}/subjects/${subject_name}/versions" 2>&1) || true
+
+            http_code=$(echo "$response" | tail -n1)
+            response_body=$(echo "$response" | head -n -1)
+
+            case $http_code in
+              200|201|202)
+                echo "✅ Success! New version: $(echo "$response_body" | jq .id)"
+                ;;
+              409)
+                echo "ℹ️ Schema already exists for subject: $subject_name"
+                latest=$(curl -sS -u "${{ inputs.api-key }}:${{ inputs.api-secret }}" \
+                  "${{ inputs.registry-url }}/subjects/${subject_name}/versions/latest" \
+                  | jq -c .schema)
+
+                if [ "$latest" = "$schema_content" ]; then
+                  echo "✅ No changes. Schema is identical to latest version."
+                else
+                  echo "🔄 Schema differs. Attempting update..."
+                  update_resp=$(curl -sS -w "\n%{http_code}" \
+                    -u "${{ inputs.api-key }}:${{ inputs.api-secret }}" \
+                    -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+                    -X POST \
+                    --data "$payload" \
+                    "${{ inputs.registry-url }}/subjects/${subject_name}/versions" 2>&1) || true
+                  update_code=$(echo "$update_resp" | tail -n1)
+                  update_body=$(echo "$update_resp" | head -n -1)
+
+                  if [ "$update_code" -eq 200 ] || [ "$update_code" -eq 201 ]; then
+                    echo "✅ Updated! New version: $(echo "$update_body" | jq .id)"
+                  else
+                    if echo "$update_body" | grep -q "incompatible"; then
+                      echo "❌ Compatibility check failed for subject: $subject_name"
+                      echo "   👉 Fix schema to be backward compatible OR relax registry compatibility settings."
+                    else
+                      echo "❌ Failed to update schema: $update_body"
+                    fi
+                    exit 1
+                  fi
+                fi
+                ;;
+              401|403)
+                echo "❌ PERMISSION DENIED: $response_body"
+                exit 1
+                ;;
+              422)
+                echo "❌ Compatibility failed: $subject_name"
+                echo "$response_body"
+                exit 1
+                ;;
+              *)
+                echo "❌ Unexpected error ($http_code): $response_body"
+                exit 1
+                ;;
+            esac
+          done
+        else
+          echo "ℹ️ No non-prod schemas found. Skipping..."
         fi
 
-        for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
-          subject_name=$(basename "$schema_file" .avsc)
-          echo "🚀 Deploying schema: $subject_name"
+    - name: Deploy prod schemas
+      shell: bash
+      run: |
+        set -eo pipefail
+        SCHEMA_DIR="Prod-Schema"
 
-          schema_content=$(jq -c . < "$schema_file")
-          payload=$(jq -n --arg schema "$schema_content" \
-            '{schema: $schema, schemaType: "AVRO"}')
+        if [ -d "$SCHEMA_DIR" ]; then
+          echo "📂 Found PROD schemas in $SCHEMA_DIR"
+          if [ -z "${{ inputs.prod-registry-url }}" ] || [ -z "${{ inputs.prod-api-key }}" ] || [ -z "${{ inputs.prod-api-secret }}" ]; then
+            echo "❌ Prod schemas detected but prod secrets are missing!"
+            exit 1
+          fi
 
-          response=$(curl -sS -w "\n%{http_code}" \
-            -u "${API_KEY}:${API_SECRET}" \
-            -H "Content-Type: application/vnd.schemaregistry.v1+json" \
-            -X POST \
-            --data "$payload" \
-            "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions" 2>&1) || true
+          echo "🔐 Validating API key permissions..."
+          if ! curl -sS -u "${{ inputs.prod-api-key }}:${{ inputs.prod-api-secret }}" \
+            "${{ inputs.prod-registry-url }}/mode" >/dev/null; then
+            echo "❌ FATAL: API key authentication failed or lacks basic permissions"
+            exit 1
+          fi
 
-          http_code=$(echo "$response" | tail -n1)
-          response_body=$(echo "$response" | head -n -1)
+          echo "🔍 Validating schemas in $SCHEMA_DIR"
+          for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
+            if ! jq empty "$schema_file" &>/dev/null; then
+              echo "❌ Invalid JSON in $schema_file"
+              exit 1
+            fi
+          done
+          echo "✅ All schemas validated"
 
-          case $http_code in
-            200|201|202)
-              echo "✅ Success! New version: $(echo "$response_body" | jq .id)"
-              ;;
-            409)
-              echo "ℹ️ Schema already exists for subject: $subject_name"
-              latest=$(curl -sS -u "${API_KEY}:${API_SECRET}" \
-                "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions/latest" \
-                | jq -c .schema)
+          for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
+            subject_name=$(basename "$schema_file" .avsc)
+            echo "🚀 Deploying schema: $subject_name"
 
-              if [ "$latest" = "$schema_content" ]; then
-                echo "✅ No changes. Schema is identical to latest version."
-              else
-                echo "🔄 Schema differs. Attempting update..."
-                update_resp=$(curl -sS -w "\n%{http_code}" \
-                  -u "${API_KEY}:${API_SECRET}" \
-                  -H "Content-Type: application/vnd.schemaregistry.v1+json" \
-                  -X POST \
-                  --data "$payload" \
-                  "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions" 2>&1) || true
-                update_code=$(echo "$update_resp" | tail -n1)
-                update_body=$(echo "$update_resp" | head -n -1)
+            schema_content=$(jq -c . < "$schema_file")
+            payload=$(jq -n --arg schema "$schema_content" \
+              '{schema: $schema, schemaType: "AVRO"}')
 
-                if [ "$update_code" -eq 200 ] || [ "$update_code" -eq 201 ]; then
-                  echo "✅ Updated! New version: $(echo "$update_body" | jq .id)"
+            response=$(curl -sS -w "\n%{http_code}" \
+              -u "${{ inputs.prod-api-key }}:${{ inputs.prod-api-secret }}" \
+              -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+              -X POST \
+              --data "$payload" \
+              "${{ inputs.prod-registry-url }}/subjects/${subject_name}/versions" 2>&1) || true
+
+            http_code=$(echo "$response" | tail -n1)
+            response_body=$(echo "$response" | head -n -1)
+
+            case $http_code in
+              200|201|202)
+                echo "✅ Success! New version: $(echo "$response_body" | jq .id)"
+                ;;
+              409)
+                echo "ℹ️ Schema already exists for subject: $subject_name"
+                latest=$(curl -sS -u "${{ inputs.prod-api-key }}:${{ inputs.prod-api-secret }}" \
+                  "${{ inputs.prod-registry-url }}/subjects/${subject_name}/versions/latest" \
+                  | jq -c .schema)
+
+                if [ "$latest" = "$schema_content" ]; then
+                  echo "✅ No changes. Schema is identical to latest version."
                 else
-                  if echo "$update_body" | grep -q "incompatible"; then
-                    echo "❌ Compatibility check failed for subject: $subject_name"
-                    echo "   👉 Fix schema to be backward compatible OR relax registry compatibility settings."
+                  echo "🔄 Schema differs. Attempting update..."
+                  update_resp=$(curl -sS -w "\n%{http_code}" \
+                    -u "${{ inputs.prod-api-key }}:${{ inputs.prod-api-secret }}" \
+                    -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+                    -X POST \
+                    --data "$payload" \
+                    "${{ inputs.prod-registry-url }}/subjects/${subject_name}/versions" 2>&1) || true
+                  update_code=$(echo "$update_resp" | tail -n1)
+                  update_body=$(echo "$update_resp" | head -n -1)
+
+                  if [ "$update_code" -eq 200 ] || [ "$update_code" -eq 201 ]; then
+                    echo "✅ Updated! New version: $(echo "$update_body" | jq .id)"
                   else
-                    echo "❌ Failed to update schema: $update_body"
+                    if echo "$update_body" | grep -q "incompatible"; then
+                      echo "❌ Compatibility check failed for subject: $subject_name"
+                      echo "   👉 Fix schema to be backward compatible OR relax registry compatibility settings."
+                    else
+                      echo "❌ Failed to update schema: $update_body"
+                    fi
+                    exit 1
                   fi
-                  exit 1
                 fi
-              fi
-              ;;
-            401|403)
-              echo "❌ PERMISSION DENIED: $response_body"
-              echo "   Required permission: 'Write' on subject: $subject_name"
-              exit 1
-              ;;
-            422)
-              echo "❌ Compatibility failed: $subject_name"
-              echo "$response_body"
-              exit 1
-              ;;
-            *)
-              echo "❌ Unexpected error ($http_code): $response_body"
-              exit 1
-              ;;
-          esac
-        done
+                ;;
+              401|403)
+                echo "❌ PERMISSION DENIED: $response_body"
+                exit 1
+                ;;
+              422)
+                echo "❌ Compatibility failed: $subject_name"
+                echo "$response_body"
+                exit 1
+                ;;
+              *)
+                echo "❌ Unexpected error ($http_code): $response_body"
+                exit 1
+                ;;
+            esac
+          done
+        else
+          echo "ℹ️ No prod schemas found. Skipping..."
+        fi
