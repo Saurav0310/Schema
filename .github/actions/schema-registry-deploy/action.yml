@@ -23,7 +23,7 @@ runs:
       run: |
         SCHEMA_DIR="${{ inputs.schema-dir }}"
         echo "🔍 Validating schemas in $SCHEMA_DIR"
-        find "$SCHEMA_DIR" -name '*.avsc' | while read schema_file; do
+        for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
           if ! jq empty "$schema_file" &>/dev/null; then
             echo "❌ Invalid JSON in $schema_file"
             exit 1
@@ -31,7 +31,7 @@ runs:
         done
         echo "✅ All schemas validated"
 
-    - name: Deploy & cleanup schemas
+    - name: Deploy schemas
       shell: bash
       env:
         SCHEMA_REGISTRY_URL: ${{ inputs.registry-url }}
@@ -40,7 +40,6 @@ runs:
       run: |
         set -eo pipefail
         SCHEMA_DIR="${{ inputs.schema-dir }}"
-        FAILED=0
 
         echo "🔐 Validating API key permissions..."
         if ! curl -sS -u "${API_KEY}:${API_SECRET}" \
@@ -49,14 +48,6 @@ runs:
           exit 1
         fi
 
-        echo "📂 Collecting local schemas..."
-        LOCAL_SUBJECTS=$(find "$SCHEMA_DIR" -name '*.avsc' -exec basename {} .avsc \;)
-
-        echo "📡 Fetching subjects from Schema Registry..."
-        REMOTE_SUBJECTS=$(curl -sS -u "${API_KEY}:${API_SECRET}" \
-          "${SCHEMA_REGISTRY_URL}/subjects" | jq -r '.[]')
-
-        # --- Deploy or Update ---
         for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
           subject_name=$(basename "$schema_file" .avsc)
           echo "🚀 Deploying schema: $subject_name"
@@ -107,48 +98,23 @@ runs:
                   else
                     echo "❌ Failed to update schema: $update_body"
                   fi
-                  FAILED=1
+                  exit 1
                 fi
               fi
               ;;
             401|403)
               echo "❌ PERMISSION DENIED: $response_body"
               echo "   Required permission: 'Write' on subject: $subject_name"
-              FAILED=1
+              exit 1
               ;;
             422)
               echo "❌ Compatibility failed: $subject_name"
               echo "$response_body"
-              FAILED=1
+              exit 1
               ;;
             *)
               echo "❌ Unexpected error ($http_code): $response_body"
-              FAILED=1
+              exit 1
               ;;
           esac
         done
-
-        # --- Cleanup (delete removed subjects) ---
-        echo "🧹 Checking for subjects to delete..."
-        for remote in $REMOTE_SUBJECTS; do
-          if ! echo "$LOCAL_SUBJECTS" | grep -qw "$remote"; then
-            echo "🗑️  Deleting subject not found locally: $remote"
-            delete_resp=$(curl -sS -w "\n%{http_code}" \
-              -u "${API_KEY}:${API_SECRET}" \
-              -X DELETE \
-              "${SCHEMA_REGISTRY_URL}/subjects/${remote}" 2>&1) || true
-            delete_code=$(echo "$delete_resp" | tail -n1)
-            delete_body=$(echo "$delete_resp" | head -n -1)
-            if [ "$delete_code" -eq 200 ] || [ "$delete_code" -eq 204 ]; then
-              echo "✅ Deleted subject: $remote"
-            else
-              echo "❌ Failed to delete subject $remote: $delete_body"
-              FAILED=1
-            fi
-          fi
-        done
-
-        if [ $FAILED -ne 0 ]; then
-          echo "::error::Some schemas failed to deploy or delete"
-          exit 1
-        fi
