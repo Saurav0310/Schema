@@ -22,7 +22,7 @@ runs:
       shell: bash
       run: |
         SCHEMA_DIR="${{ inputs.schema-dir }}"
-        echo "Validating schemas in $SCHEMA_DIR"
+        echo "🔍 Validating schemas in $SCHEMA_DIR"
         find "$SCHEMA_DIR" -name '*.avsc' | while read schema_file; do
           if ! jq empty "$schema_file" &>/dev/null; then
             echo "❌ Invalid JSON in $schema_file"
@@ -42,7 +42,7 @@ runs:
         SCHEMA_DIR="${{ inputs.schema-dir }}"
         FAILED=0
         
-        echo "Validating API key permissions..."
+        echo "🔐 Validating API key permissions..."
         if ! curl -sS -u "${API_KEY}:${API_SECRET}" \
           "${SCHEMA_REGISTRY_URL}/mode" >/dev/null; then
           echo "❌ FATAL: API key authentication failed or lacks basic permissions"
@@ -53,7 +53,8 @@ runs:
           subject_name=$(basename "$schema_file" .avsc)
           echo "🚀 Deploying schema: $subject_name"
 
-          payload=$(jq -n --arg schema "$(cat "$schema_file" | jq -c .)" \
+          schema_content=$(jq -c . < "$schema_file")
+          payload=$(jq -n --arg schema "$schema_content" \
             '{schema: $schema, schemaType: "AVRO"}')
 
           response=$(curl -sS -w "\n%{http_code}" \
@@ -70,13 +71,37 @@ runs:
             200|201|202)
               echo "✅ Success! New version: $(echo "$response_body" | jq .id)"
               ;;
+            409)
+              echo "ℹ️ Schema already exists for subject: $subject_name"
+              latest=$(curl -sS -u "${API_KEY}:${API_SECRET}" \
+                "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions/latest" \
+                | jq -c .schema)
+
+              if [ "$latest" = "$schema_content" ]; then
+                echo "✅ No changes. Schema is identical to latest version."
+              else
+                echo "🔄 Schema differs. Registering new version..."
+                update_resp=$(curl -sS -w "\n%{http_code}" \
+                  -u "${API_KEY}:${API_SECRET}" \
+                  -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+                  -X POST \
+                  --data "$payload" \
+                  "${SCHEMA_REGISTRY_URL}/subjects/${subject_name}/versions" 2>&1) || true
+                update_code=$(echo "$update_resp" | tail -n1)
+                update_body=$(echo "$update_resp" | head -n -1)
+
+                if [ "$update_code" -eq 200 ] || [ "$update_code" -eq 201 ]; then
+                  echo "✅ Updated! New version: $(echo "$update_body" | jq .id)"
+                else
+                  echo "❌ Failed to update schema: $update_body"
+                  FAILED=1
+                fi
+              fi
+              ;;
             401|403)
               echo "❌ PERMISSION DENIED: $response_body"
               echo "   Required permission: 'Write' on subject: $subject_name"
               FAILED=1
-              ;;
-            409)
-              echo "⚠️  Schema already exists: $subject_name"
               ;;
             422)
               echo "❌ Compatibility failed: $subject_name"
