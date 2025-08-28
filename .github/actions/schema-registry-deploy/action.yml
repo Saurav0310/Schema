@@ -31,7 +31,7 @@ runs:
         done
         echo "✅ All schemas validated"
 
-    - name: Deploy schemas
+    - name: Deploy & cleanup schemas
       shell: bash
       env:
         SCHEMA_REGISTRY_URL: ${{ inputs.registry-url }}
@@ -41,7 +41,7 @@ runs:
         set -eo pipefail
         SCHEMA_DIR="${{ inputs.schema-dir }}"
         FAILED=0
-        
+
         echo "🔐 Validating API key permissions..."
         if ! curl -sS -u "${API_KEY}:${API_SECRET}" \
           "${SCHEMA_REGISTRY_URL}/mode" >/dev/null; then
@@ -49,7 +49,15 @@ runs:
           exit 1
         fi
 
-        find "$SCHEMA_DIR" -name '*.avsc' | while read -r schema_file; do
+        echo "📂 Collecting local schemas..."
+        LOCAL_SUBJECTS=$(find "$SCHEMA_DIR" -name '*.avsc' -exec basename {} .avsc \;)
+
+        echo "📡 Fetching subjects from Schema Registry..."
+        REMOTE_SUBJECTS=$(curl -sS -u "${API_KEY}:${API_SECRET}" \
+          "${SCHEMA_REGISTRY_URL}/subjects" | jq -r '.[]')
+
+        # --- Deploy or Update ---
+        for schema_file in $(find "$SCHEMA_DIR" -name '*.avsc'); do
           subject_name=$(basename "$schema_file" .avsc)
           echo "🚀 Deploying schema: $subject_name"
 
@@ -80,7 +88,7 @@ runs:
               if [ "$latest" = "$schema_content" ]; then
                 echo "✅ No changes. Schema is identical to latest version."
               else
-                echo "🔄 Schema differs. Registering new version..."
+                echo "🔄 Schema differs. Attempting update..."
                 update_resp=$(curl -sS -w "\n%{http_code}" \
                   -u "${API_KEY}:${API_SECRET}" \
                   -H "Content-Type: application/vnd.schemaregistry.v1+json" \
@@ -93,7 +101,12 @@ runs:
                 if [ "$update_code" -eq 200 ] || [ "$update_code" -eq 201 ]; then
                   echo "✅ Updated! New version: $(echo "$update_body" | jq .id)"
                 else
-                  echo "❌ Failed to update schema: $update_body"
+                  if echo "$update_body" | grep -q "incompatible"; then
+                    echo "❌ Compatibility check failed for subject: $subject_name"
+                    echo "   👉 Fix schema to be backward compatible OR relax registry compatibility settings."
+                  else
+                    echo "❌ Failed to update schema: $update_body"
+                  fi
                   FAILED=1
                 fi
               fi
@@ -115,7 +128,27 @@ runs:
           esac
         done
 
+        # --- Cleanup (delete removed subjects) ---
+        echo "🧹 Checking for subjects to delete..."
+        for remote in $REMOTE_SUBJECTS; do
+          if ! echo "$LOCAL_SUBJECTS" | grep -qw "$remote"; then
+            echo "🗑️  Deleting subject not found locally: $remote"
+            delete_resp=$(curl -sS -w "\n%{http_code}" \
+              -u "${API_KEY}:${API_SECRET}" \
+              -X DELETE \
+              "${SCHEMA_REGISTRY_URL}/subjects/${remote}" 2>&1) || true
+            delete_code=$(echo "$delete_resp" | tail -n1)
+            delete_body=$(echo "$delete_resp" | head -n -1)
+            if [ "$delete_code" -eq 200 ] || [ "$delete_code" -eq 204 ]; then
+              echo "✅ Deleted subject: $remote"
+            else
+              echo "❌ Failed to delete subject $remote: $delete_body"
+              FAILED=1
+            fi
+          fi
+        done
+
         if [ $FAILED -ne 0 ]; then
-          echo "::error::Some schemas failed to deploy"
+          echo "::error::Some schemas failed to deploy or delete"
           exit 1
         fi
